@@ -437,16 +437,21 @@ the deferred families (`Cron*`, `Task*`, `RemoteTrigger`,
 run's own `events.jsonl` is evidence for both halves of the symptom, not
 only the directly-callable one.
 
-**Two deliberate, documented deviations** — a run is *not* narrowed by
-this mechanism in exactly these two cases:
+**One deliberate, documented deviation** — a run is *not* narrowed by
+this mechanism in exactly this case:
 
 - **No `tools:` at all.** A definition that never sets `tools:` gets no
   top-level `--tools` flag; the child keeps the entrypoint's full default
   set (the same asymmetry CLEAN's own `tools` row above documents).
-- **`disallowedTools:`-only.** `--tools` is an *allow*list with no
-  top-level deny-flag counterpart, so a definition that sets only
-  `disallowedTools:` (no `tools:`) is not narrowed at the session level
-  either — only the agent scope sees `disallowedTools`.
+
+A definition that sets `disallowedTools:` (with or without `tools:`) *is*
+narrowed at the session level too: `resolve()` puts it on
+`RunSpec.disallowed_tools`, and both `_build_clean_plan` and
+`_build_inherit_plan` now emit it as a top-level `--disallowedTools`
+session denylist (comma-joined, same `_split_tools` normalizer), in
+addition to whatever agent-scope carrier (`--agents` JSON
+`disallowedTools` array, or the materialized file's own `disallowedTools:`
+line) the dispatch mode already uses.
 
 ### CodexCliProvider
 
@@ -850,7 +855,7 @@ just through the materialized path or a converted array).
 | `permissionMode`    | top-level `--permission-mode` | `permissionMode:`        | dropped at plugin scope                  |
 | `effort`            | top-level `--effort`          | (not carried)            | definition-else-context                  |
 | `tools`             | `--agents` `tools` (as array) | `tools:` (scalar)        | never a top-level `--allowedTools`; *also* becomes a top-level `--tools` session allowlist (comma-joined), independent of `payload`/`materialized` — see "Harness runs get a different default tool set than native subagents" below |
-| `disallowedTools`   | `--agents` `disallowedTools`  | `disallowedTools:`       | never a top-level `--disallowedTools`    |
+| `disallowedTools`   | `--agents` `disallowedTools`  | `disallowedTools:`       | *also* a top-level `--disallowedTools` (comma-joined), independent of `payload`/`materialized` |
 | `skills`            | `--agents` `skills`           | `skills:`                |                                           |
 | `maxTurns`          | `--agents` `maxTurns`         | `maxTurns:`              | never a top-level `--max-turns` (no such flag) |
 | `hooks`             | (forces `materialized`)       | `hooks:`                 | dropped at plugin scope                  |
@@ -930,9 +935,9 @@ Semantics worth knowing:
   project). `clean` runs in a fresh temp directory (never the parent's
   cwd) and carries only what the file states: `model`, `permissionMode`, a
   `--tools` allowlist and an `--mcp-config` set (its base is empty). A
-  clean child has no `--agents`/`--agent` binding and no
-  `disallowedTools` (its `--tools` allowlist is exact). A named profile is
-  `inherit` plus its fields: `settingSources` -> `--setting-sources`
+  clean child has no `--agents`/`--agent` binding; a stated
+  `disallowedTools` is still carried, as a top-level `--disallowedTools`.
+  A named profile is `inherit` plus its fields: `settingSources` -> `--setting-sources`
   (`[]` emits the flag with an empty operand), `strictMcp`, `omitClaudeMd`,
   and `memory: false`. `tools` is *not* profile-specific: any INHERIT
   dispatch whose resolved `RunSpec.tools` is set — profile, plain agent
