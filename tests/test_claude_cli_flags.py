@@ -8,12 +8,14 @@ drop the criterion names").
 """
 from __future__ import annotations
 
+import json
 import re
 import uuid
 from pathlib import Path
 
 import pytest
 
+from lib_python_harness.agents.frontmatter import parse_frontmatter
 from lib_python_harness.providers.base import Isolation, RunSpec
 from lib_python_harness.providers.claude_cli import ClaudeCliProvider, SCRUBBED_ENV
 from lib_python_harness.errors import UnsafeCwdError
@@ -51,6 +53,26 @@ def _build_plan(tmp_path, **spec_overrides):
     spec = RunSpec(**kwargs)
     provider = ClaudeCliProvider()
     run_dir = tmp_path / "run"
+    return provider.build_launch_plan(spec, session_id=str(uuid.uuid4()), run_dir=run_dir)
+
+
+def _inherit_plan(tmp_path, run_dir=None, **spec_overrides):
+    """Ticket #53 R1's own INHERIT builder — deliberately independent of
+    `tests/test_resolve_inherit.py`'s `_inherit_plan` (same shape, but this
+    module must not depend on another test module's internals)."""
+    repo = tmp_path / "repo"
+    repo.mkdir(exist_ok=True)
+    kwargs = dict(
+        prompt="Reply with exactly OK",
+        isolation=Isolation.INHERIT,
+        model="haiku",
+        cwd=repo,
+    )
+    kwargs.update(spec_overrides)
+    spec = RunSpec(**kwargs)
+    provider = ClaudeCliProvider()
+    if run_dir is None:
+        run_dir = tmp_path / "run"
     return provider.build_launch_plan(spec, session_id=str(uuid.uuid4()), run_dir=run_dir)
 
 
@@ -167,3 +189,116 @@ def test_nonempty_non_repo_cwd_raises_unless_opted_in(tmp_path):
         spec_opt_in, session_id=str(uuid.uuid4()), run_dir=tmp_path / "run2"
     )
     assert Path(plan.cwd) == populated
+
+
+# -- #53 R1: --disallowedTools promoted to a top-level argv flag, mirroring
+# --tools, for both Isolation.CLEAN and Isolation.INHERIT and both dispatch
+# outcomes. -------------------------------------------------------------
+
+# `_split_tools`-normalised: embedded whitespace-only/empty items are
+# dropped, surviving items are comma-joined with no spaces. Deliberately not
+# a single bare name — a builder that emitted the raw, unnormalised operand
+# would still pass a test that only checked for one flag's presence.
+_DISALLOWED_RAW = "Bash ,, WebFetch"
+_DISALLOWED_SPLIT = "Bash,WebFetch"
+
+
+def _assert_one_disallowed_flag(argv, expected_operand):
+    assert argv.count("--disallowedTools") == 1, argv
+    idx = argv.index("--disallowedTools")
+    assert argv[idx + 1] == expected_operand
+
+
+def _arm_clean_no_agent(tmp_path):
+    plan = _build_plan(tmp_path, disallowed_tools=_DISALLOWED_RAW)
+    _assert_one_disallowed_flag(plan.argv, _DISALLOWED_SPLIT)
+    assert "--agents" not in plan.argv
+    assert "--agent" not in plan.argv
+
+    # A second, different value catches an operand hard-coded to the first
+    # one ever tried.
+    other_plan = _build_plan(tmp_path, disallowed_tools="Edit")
+    _assert_one_disallowed_flag(other_plan.argv, "Edit")
+
+
+def _arm_clean_with_agent(tmp_path):
+    # `agent_name` set on a CLEAN spec is otherwise inert (`_build_clean_plan`
+    # never reads it) — this arm proves CLEAN ignores dispatch entirely, it
+    # is not exercising a real CLEAN+agent feature.
+    plan = _build_plan(tmp_path, agent_name="probe", disallowed_tools=_DISALLOWED_RAW)
+    _assert_one_disallowed_flag(plan.argv, _DISALLOWED_SPLIT)
+    assert "--agents" not in plan.argv
+    assert "--agent" not in plan.argv
+
+
+def _arm_clean_with_agent_and_mcp(tmp_path):
+    plan = _build_plan(
+        tmp_path,
+        agent_name="probe",
+        mcp_servers={"demo": {"command": "x"}},
+        disallowed_tools=_DISALLOWED_RAW,
+    )
+    _assert_one_disallowed_flag(plan.argv, _DISALLOWED_SPLIT)
+    assert "--agents" not in plan.argv
+    assert "--agent" not in plan.argv
+
+
+def _arm_inherit_payload(tmp_path):
+    plan = _inherit_plan(tmp_path, agent_name="probe", disallowed_tools=_DISALLOWED_RAW)
+    _assert_one_disallowed_flag(plan.argv, _DISALLOWED_SPLIT)
+    # The existing --agents JSON carrier stays exactly as it was.
+    assert "--agents" in plan.argv
+    agents_json = json.loads(plan.argv[plan.argv.index("--agents") + 1])
+    assert agents_json["probe"]["disallowedTools"] == ["Bash", "WebFetch"]
+
+
+def _arm_inherit_materialized(tmp_path):
+    run_dir = tmp_path / "run"
+    plan = _inherit_plan(
+        tmp_path,
+        run_dir=run_dir,
+        agent_name="probe",
+        mcp_servers={"demo": {"command": "x"}},
+        disallowed_tools=_DISALLOWED_RAW,
+    )
+    _assert_one_disallowed_flag(plan.argv, _DISALLOWED_SPLIT)
+    assert "--agents" not in plan.argv
+    # The existing materialized-frontmatter carrier stays exactly as it
+    # was — verbatim scalar, not the top-level flag's normalised form.
+    materialized_path = run_dir / "agents" / ".claude" / "agents" / "probe.md"
+    fields, _body = parse_frontmatter(materialized_path.read_text())
+    assert fields["disallowedTools"] == _DISALLOWED_RAW
+
+
+_DISALLOWED_TOOLS_ARMS = {
+    "clean-no-agent": _arm_clean_no_agent,
+    "clean-with-agent": _arm_clean_with_agent,
+    "clean-with-agent-and-mcp": _arm_clean_with_agent_and_mcp,
+    "inherit-payload": _arm_inherit_payload,
+    "inherit-materialized": _arm_inherit_materialized,
+}
+
+
+@pytest.mark.parametrize(
+    "arm", _DISALLOWED_TOOLS_ARMS.values(), ids=_DISALLOWED_TOOLS_ARMS.keys()
+)
+def test_disallowed_tools_becomes_one_top_level_flag(tmp_path, arm):
+    arm(tmp_path)
+
+
+def test_disallowed_tools_none_emits_no_flag(tmp_path):
+    # Passes before and after the change — `None` never carried a flag.
+    plan = _build_plan(tmp_path)
+    assert "--disallowedTools" not in plan.argv
+
+    inherit_plan = _inherit_plan(tmp_path)
+    assert "--disallowedTools" not in inherit_plan.argv
+
+
+def test_disallowed_tools_empty_string_emits_flag_with_empty_operand(tmp_path):
+    # Same `is not None` gate as --tools: "" still emits the flag.
+    plan = _build_plan(tmp_path, disallowed_tools="")
+    _assert_one_disallowed_flag(plan.argv, "")
+
+    inherit_plan = _inherit_plan(tmp_path, disallowed_tools="")
+    _assert_one_disallowed_flag(inherit_plan.argv, "")
