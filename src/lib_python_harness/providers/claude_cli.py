@@ -419,6 +419,8 @@ class ClaudeCliProvider:
             argv += ["--permission-mode", spec.permission_mode]
 
         argv += _profile_argv(spec)
+        if spec.disallowed_tools is not None:
+            argv += ["--disallowedTools", ",".join(_split_tools(spec.disallowed_tools) or [])]
 
         if spec.mcp_servers:
             # CLEAN always carries --strict-mcp-config, so the named set is
@@ -459,6 +461,8 @@ class ClaudeCliProvider:
             argv += ["--strict-mcp-config"]
         if spec.tools is not None:
             argv += ["--tools", ",".join(_split_tools(spec.tools) or [])]
+        if spec.disallowed_tools is not None:
+            argv += ["--disallowedTools", ",".join(_split_tools(spec.disallowed_tools) or [])]
         argv += ["--output-format", "stream-json", "--verbose"]
 
         if spec.mcp_servers:

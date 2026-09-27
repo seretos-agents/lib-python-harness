@@ -375,10 +375,12 @@ def test_mcp_servers_falls_back_to_host_context_when_definition_unset():
     assert spec.mcp_servers == {"parent": {"command": "parent-server"}}
 
 
-def test_tools_and_disallowed_tools_never_become_top_level_argv_flags(tmp_path):
+def test_tools_never_become_a_top_level_allowed_tools_flag(tmp_path):
+    # #53: `--disallowedTools` *does* now become a top-level argv flag (see
+    # tests/test_claude_cli_flags.py's R1 driving test) — only the allowlist
+    # keeps `--tools` as its flag name, never `--allowedTools`.
     plan = _inherit_plan(tmp_path, tools="Read", disallowed_tools="Bash")
     assert "--allowedTools" not in plan.argv
-    assert "--disallowedTools" not in plan.argv
 
 
 def test_definition_tools_become_the_session_allowlist_and_the_agent_scope(tmp_path):
