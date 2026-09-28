@@ -48,6 +48,7 @@ from .runtime.process import (
     _reap_until_gone,
     _send_graceful_signal,
     _spawn_detached,
+    _wait_or_kill,
     resolve_executable,
 )
 from .runtime.store import InMemoryRunStore, RunStore
@@ -57,11 +58,22 @@ DEFAULT_STOP_TIMEOUT = 10.0
 _LIVE_STATES = (RunState.CREATED, RunState.RUNNING)
 _TERMINAL_STATES = (RunState.COMPLETED, RunState.FAILED, RunState.CANCELLED)
 
-# How long `wait_for` lets a vanished process's record stay RUNNING before it
-# finalizes the run itself: a `stop()` in the starter's process kills the pid
-# first and writes CANCELLED a moment later, and there is no cross-process lock
-# to close that race, so the observer waits it out instead of writing FAILED
-# over a cancel in flight.
+# Two uses, same value, same idea -- give a run that looks done a short
+# window before `wait()` acts on it unilaterally:
+# 1. How long `wait_for` lets a vanished process's record stay RUNNING before
+#    it finalizes the run itself: a `stop()` in the starter's process kills
+#    the pid first and writes CANCELLED a moment later, and there is no
+#    cross-process lock to close that race, so the observer waits it out
+#    instead of writing FAILED over a cancel in flight.
+# 2. (#55) How long a provider's child gets to exit on its own after its
+#    terminal `result` event has been written before `wait()` grace-kills it
+#    (`_kill_lingering`, via `_wait_or_kill` which itself waits up to this
+#    same value after the graceful signal) -- a clean `claude -p` child that
+#    keeps running past its own terminal event must not hold `wait()`
+#    hostage. The two grace windows are independent and can both apply on
+#    the grace-kill path (signal -> up to `_FINALIZE_GRACE_S` for the
+#    graceful exit -> force kill), so the worst-case bound there is close to
+#    `2 * _FINALIZE_GRACE_S`, not one grace period.
 _FINALIZE_GRACE_S = 3.0
 
 
@@ -461,7 +473,14 @@ class Harness:
         has been gone for a short grace period (so a `stop()` running in the
         starter's process wins and is reported `CANCELLED`); with no exit
         code known, the terminal event alone decides `COMPLETED` vs `FAILED`.
-        Raises `HarnessError` for an unknown `run_id`.
+        A provider child that has already written its terminal event but
+        keeps the OS process alive (#55) is likewise grace-killed after a
+        short period and finalized from that event alone, whichever process
+        is waiting — except when the pid's identity cannot be verified (no
+        `psutil`/`start_time` and this process never held the `Popen`
+        itself), in which case `wait()` never signals it and just keeps
+        waiting as it always did. Raises `HarnessError` for an unknown
+        `run_id`.
         """
         deadline = None if timeout is None else time.monotonic() + timeout
         gone_since: float | None = None
@@ -479,6 +498,14 @@ class Harness:
                         continue
                 else:
                     gone_since = None
+                    written_at = self._result_written_at(run_id, record)
+                    if (
+                        written_at is not None
+                        and time.time() - written_at >= _FINALIZE_GRACE_S
+                        and self._kill_lingering(run_id, record)
+                    ):
+                        self._finalize(run_id, record, None)
+                        continue
             if record["state"] in _TERMINAL_STATES:
                 return self._record_to_result(record)
             remaining = None if deadline is None else deadline - time.monotonic()
@@ -655,6 +682,68 @@ class Harness:
             self._finalize(run_id, record, None)
             return True
         return False
+
+    def _result_written_at(self, run_id: str, record: dict[str, Any]) -> float | None:
+        """When the run's terminal `result` event was written (#55), or
+        `None` when it hasn't been yet, its provider has no
+        `has_terminal_event` probe (looked up with `getattr`, like
+        `_describe_activity` — Codex/Mistral/an injected fake without the
+        method are never grace-killed), or anything about reading the events
+        file goes wrong.
+
+        The events file's own mtime is the anchor, not `time.time()` at
+        probe time: `result` is the child's last write, so the mtime already
+        *is* the moment it landed (a later write only delays the kill, it
+        never advances it). Anchoring there rather than to a loop-local
+        variable means repeated short `wait()` calls, a fresh observer
+        process, and a late-arriving waiter all measure the same grace
+        window from the same point (critic F1)."""
+        try:
+            provider = self._run_providers.get(run_id)
+            if provider is None:
+                provider = self._resolve_recorded_provider(record)
+            probe = getattr(provider, "has_terminal_event", None)
+            if probe is None:
+                return None
+            events_path = record.get("events_path")
+            if events_path is None:
+                return None
+            events_path = Path(events_path)
+            if not probe(self._read_event_lines(events_path)):
+                return None
+            return events_path.stat().st_mtime
+        except Exception:
+            return None
+
+    def _kill_lingering(self, run_id: str, record: dict[str, Any]) -> bool:
+        """Grace-kill the run's child once its terminal event has aged past
+        `_FINALIZE_GRACE_S` (#55). Verifies pid identity first — an
+        unverifiable pid (`_pid_status` returns `None`) is never signalled
+        unless this process still holds the child's own `Popen`, exactly
+        `stop()`'s rule; a pid already confirmed gone is left to the
+        ended/gone paths. Otherwise reuses `_wait_or_kill` for the real
+        signal -> bounded wait -> force-kill -> reap sequence. Returns
+        whether it killed (i.e. the caller may now finalize from the
+        terminal event alone)."""
+        pid = record.get("pid")
+        if pid is None:
+            return False
+        proc = self._processes.get(run_id)
+        start_time = record.get("start_time")
+        status = _pid_status(pid, start_time)
+        if status is None:
+            if proc is None:
+                return False  # cannot verify identity; never signal
+            status = True  # this process still holds the child's Popen
+        if not status:
+            return False  # already gone; the ended/gone paths handle it
+        _wait_or_kill(pid, _FINALIZE_GRACE_S, start_time)
+        if proc is not None:
+            try:
+                proc.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                pass
+        return True
 
     @staticmethod
     def _read_event_lines(events_path: Path) -> list[str]:

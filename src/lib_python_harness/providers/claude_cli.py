@@ -559,6 +559,26 @@ class ClaudeCliProvider:
                 return label
         return None
 
+    def has_terminal_event(self, lines: Iterable[str]) -> bool:
+        """`True` iff some line in `lines` parses to a dict with
+        `type == "result"` — the post-completion grace-kill's scoping probe
+        (#55): `Harness` looks this up with `getattr`, like
+        `describe_last_activity`, so a provider without it (Codex, Mistral,
+        an injected fake) is never grace-killed. Torn/garbage lines are
+        skipped, never raised on — the same tolerance `describe_last_activity`
+        applies to a still-growing stream."""
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(event, dict) and event.get("type") == "result":
+                return True
+        return False
+
     @staticmethod
     def _content_blocks(event: Any) -> list[dict]:
         """The dict blocks of an event's `message.content` list — the shape

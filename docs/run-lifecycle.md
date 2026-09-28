@@ -76,6 +76,17 @@ new `RunState` and no new edge are added to the table above.
   the process vanished so a `stop()` running in the starter's process is
   reported `CANCELLED`, not `FAILED`. On Windows the start time comes from
   `GetProcessTimes` via `ctypes`; `psutil` is not required.
+- **Post-completion grace-kill (#55).** A provider child that has already
+  written its terminal event to `events.jsonl` (scoped by
+  `Provider.has_terminal_event`, when the provider has one — today only
+  `ClaudeCliProvider`) but keeps its OS process alive is killed by `wait()`
+  once that event has aged past `_FINALIZE_GRACE_S`, and the run is finalized
+  from the terminal event alone, same as orphan reconciliation above; the
+  grace window is anchored to the events file's own mtime, not to when a
+  particular `wait()` call started, so it survives repeated short calls and
+  late-arriving observers alike. It never signals a pid whose identity can't
+  be verified — that case just keeps waiting, exactly like orphan
+  reconciliation's own identity check.
 - **Idempotent finalization.** Before writing, finalization re-reads the stored
   record and keeps it when it is already terminal. There is no cross-process
   lock, so this narrows the race rather than closing it.
