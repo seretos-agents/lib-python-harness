@@ -251,3 +251,24 @@ def test_two_launches_with_one_notified_give_only_the_other():
     )
     result = ClaudeCliProvider().parse_events(lines)
     assert result.abandoned_background_tasks == ("L2",)
+
+
+# -- #55 R3: has_terminal_event -- the grace-kill probe ----------------------
+#
+# `Harness` looks this method up with `getattr` (like `describe_last_activity`)
+# to decide whether a provider's child is even eligible for the post-result
+# grace-kill; a provider without it (codex, mistral, fakes injected directly)
+# is never grace-killed. Driven directly against `ClaudeCliProvider`, offline:
+# true iff some line parses to a dict with `type == "result"`, torn/garbage
+# lines skipped rather than raising.
+
+
+def test_has_terminal_event_detects_only_a_result_line():
+    provider = ClaudeCliProvider()
+    assert provider.has_terminal_event([_INIT_LINE, _TERMINAL_RESULT]) is True
+    assert provider.has_terminal_event([_TERMINAL_RESULT]) is True
+    assert provider.has_terminal_event([_INIT_LINE]) is False
+    assert provider.has_terminal_event([]) is False
+    # torn/garbage lines are skipped, not raised on
+    assert provider.has_terminal_event(["not json at all", '{"type": "res']) is False
+    assert provider.has_terminal_event(["not json at all", _TERMINAL_RESULT]) is True

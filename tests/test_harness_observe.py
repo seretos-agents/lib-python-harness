@@ -18,6 +18,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import lib_python_harness.harness as harness_module
 from lib_python_harness import (
     FileRunStore,
     Harness,
@@ -27,7 +28,8 @@ from lib_python_harness import (
     RunSpec,
     RunState,
 )
-from lib_python_harness.runtime.process import _capture_start_time, _pid_status
+from lib_python_harness.harness import _FINALIZE_GRACE_S
+from lib_python_harness.runtime.process import _capture_start_time, _pid_status, _wait_or_kill
 
 FIXTURES = Path(__file__).parent / "fixtures"
 FAKE_CLAUDE = FIXTURES / "fake_claude.py"
@@ -590,3 +592,138 @@ def test_running_result_last_activity_is_none_for_an_unrecognizable_stream(tmp_p
     assert result.state is RunState.RUNNING
     assert result.last_activity is None
     assert result.duration_s is not None and 5 <= result.duration_s < 60
+
+
+# -- #55: post-completion grace-kill in wait() -------------------------------
+#
+# A CLEAN `claude -p` child that has already written its own terminal
+# `result` event but keeps the OS process alive must not hold `wait()`
+# hostage. `--linger <s>` (tests/fixtures/fake_claude.py) reproduces exactly
+# that shape: the terminal event lands on disk, then the child sleeps well
+# past the point wait() should have returned.
+
+_GRACE_BOUND = 2 * _FINALIZE_GRACE_S + 5  # generous bound: covers one grace period plus slack
+
+
+def test_wait_grace_kills_a_child_lingering_after_its_result(tmp_path):
+    """R1 driving test: the starter's own `wait()` (this process holds the
+    `Popen`) returns COMPLETED promptly once the terminal event is on disk,
+    without waiting for the OS process itself to exit."""
+    store = InMemoryRunStore()
+    harness = _harness_with_fake(store, "--linger", "60")
+    run_id = harness.start(_spec(tmp_path)).run_id
+
+    began = time.monotonic()
+    result = harness.wait(run_id, timeout=30)
+    elapsed = time.monotonic() - began
+
+    assert result.state is RunState.COMPLETED
+    assert result.text == "OK"
+    assert result.timed_out is False
+    assert elapsed < _GRACE_BOUND, f"wait() took {elapsed:.1f}s, expected a prompt grace-kill"
+
+    record = store.get(run_id)
+    assert _pid_status(record["pid"], record["start_time"]) is False, "child was not killed"
+
+
+def test_wait_grace_kills_a_lingering_child_with_an_abandoned_background_task(tmp_path):
+    """R1 additional coverage (a): the grace-kill finalizes from the terminal
+    event alone, so an abandoned background task still fails the run exactly
+    as it would for a child that exited normally."""
+    store = InMemoryRunStore()
+    harness = _harness_with_fake(store, "--background-task", "bg1", "--linger", "60")
+    run_id = harness.start(_spec(tmp_path)).run_id
+
+    result = harness.wait(run_id, timeout=30)
+
+    assert result.state is RunState.FAILED
+    assert result.abandoned_background_tasks == ("bg1",)
+
+
+def test_repeated_short_waits_still_grace_kill_a_lingering_child(tmp_path):
+    """R1 additional coverage (b) -- F1 guard: the grace anchor must persist
+    across repeated wait() calls (it lives on the events file's mtime, not on
+    a loop-local variable). Each call here times out (1.0s) well before the
+    grace period (3.0s) elapses, so a per-call timer would never fire and
+    this would spin to its deadline still RUNNING -- this test is RED against
+    that shape of implementation too, not just against today's no-hook code."""
+    store = InMemoryRunStore()
+    harness = _harness_with_fake(store, "--linger", "60")
+    run_id = harness.start(_spec(tmp_path)).run_id
+
+    deadline = time.monotonic() + _GRACE_BOUND
+    result = harness.wait(run_id, timeout=1.0)
+    while result.timed_out and time.monotonic() < deadline:
+        result = harness.wait(run_id, timeout=1.0)
+
+    assert result.timed_out is False
+    assert result.state is RunState.COMPLETED
+
+
+def test_observer_wait_grace_kills_a_lingering_foreign_child(tmp_path):
+    """R2 driving test: a cross-process waiter (no `Popen`, only the
+    recorded pid+start_time) grace-kills a verified-identity pid too."""
+    run_id = _start_and_let_starter_exit(tmp_path, fake_args=["--linger", "60"])
+    observer = _observer(tmp_path)
+
+    began = time.monotonic()
+    result = observer.wait(run_id, timeout=30)
+    elapsed = time.monotonic() - began
+
+    assert result.state is RunState.COMPLETED
+    assert result.text == "OK"
+    assert result.timed_out is False
+    assert elapsed < _GRACE_BOUND, f"wait() took {elapsed:.1f}s, expected a prompt grace-kill"
+
+    record = FileRunStore(tmp_path).get(run_id)
+    assert _pid_status(record["pid"], record["start_time"]) is False, "child was not killed"
+
+
+def test_late_observer_kills_without_a_fresh_grace(tmp_path):
+    """R2 additional coverage (a): the grace anchor is the events file's
+    mtime (when `result` was written), not the moment this particular
+    wait() call began -- an observer that shows up well after the grace
+    period has already elapsed kills (and finalizes) on its very first,
+    short wait()."""
+    run_id = _start_and_let_starter_exit(tmp_path, fake_args=["--linger", "60"])
+    time.sleep(_FINALIZE_GRACE_S + 1)
+
+    observer = _observer(tmp_path)
+    result = observer.wait(run_id, timeout=1.5)
+
+    assert result.state is RunState.COMPLETED
+    assert result.timed_out is False
+
+
+def test_observer_wait_never_signals_an_unverifiable_pid(tmp_path, monkeypatch):
+    """R2 additional coverage (b): with no held `Popen` (foreign observer)
+    and no verifiable `start_time`, `wait()` must never signal the pid --
+    already true of today's code (there is no grace-kill hook at all yet),
+    pinned here as the contract `_kill_lingering` must keep once the hook
+    exists."""
+    run_id = _start_and_let_starter_exit(tmp_path, fake_args=["--linger", "60"])
+    store = FileRunStore(tmp_path)
+    record = store.get(run_id)
+    pid = record["pid"]
+    real_start_time = record["start_time"]
+    record["start_time"] = None
+    store.put(run_id, record)
+
+    calls = []
+    monkeypatch.setattr(
+        harness_module,
+        "_wait_or_kill",
+        lambda *a, **k: calls.append((a, k)),
+        raising=False,
+    )
+
+    try:
+        observer = _observer(tmp_path)
+        result = observer.wait(run_id, timeout=_FINALIZE_GRACE_S + 2)
+
+        assert result.timed_out is True
+        assert result.state is RunState.RUNNING
+        assert calls == [], "an unverifiable pid must never be signalled"
+        assert _pid_status(pid, real_start_time) is True, "child must still be alive, untouched"
+    finally:
+        _wait_or_kill(pid, 5.0, real_start_time)

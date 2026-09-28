@@ -19,6 +19,14 @@ terminal event, so nothing would be left to cancel). Reads and discards
 stdin (the prompt), then emits a fixed stream-json event sequence ending in
 a terminal ``result`` event, mimicking
 ``claude -p --output-format stream-json --verbose``.
+
+``--linger <seconds>`` (#55): sleep AFTER the terminal ``result`` event has
+already been printed (and flushed), instead of before it -- reproduces a
+clean `claude` CLI child that keeps its OS process alive for a while past
+having already written its own terminal event. The opposite end of
+``--sleep`` (which delays the child from writing `result` at all): here the
+event is on disk, timestamped by the moment `events.jsonl`'s mtime updates,
+before the process itself lingers.
 """
 from __future__ import annotations
 
@@ -310,6 +318,10 @@ def main() -> int:
         return exit_code
     for event in events:
         print(json.dumps(event), flush=True)
+    if "--linger" in argv:
+        idx = argv.index("--linger")
+        linger_seconds = float(argv[idx + 1]) if idx + 1 < len(argv) else 5.0
+        time.sleep(linger_seconds)
     return exit_code
 
 
