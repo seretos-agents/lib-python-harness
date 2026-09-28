@@ -90,7 +90,11 @@ alive) instead of killing the run. Only an explicit `stop()` yields
 `CANCELLED`. A run whose process vanished without being finalized is finalized
 by the observer (no exit code is known then, so the terminal `result` event
 alone decides `COMPLETED` vs `FAILED`; a `stop()` in the starter's process is
-still reported `CANCELLED`). `list_runs()` returns a `RunSummary` per stored
+still reported `CANCELLED`). A provider child that has already written its
+terminal event but keeps the OS process alive is grace-killed after a short
+period and finalized from that event alone (#55) — unless the pid's identity
+can't be verified, in which case `wait()` never signals it and just keeps
+waiting. `list_runs()` returns a `RunSummary` per stored
 run, oldest first, reconciling orphaned `RUNNING` records the same way `poll()`
 does. While a run is `RUNNING`, `poll()` and a timed-out `wait()` also report
 `duration_s`, `event_count`, `last_event_at` and `last_activity` (see
