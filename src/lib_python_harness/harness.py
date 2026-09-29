@@ -64,7 +64,10 @@ _TERMINAL_STATES = (RunState.COMPLETED, RunState.FAILED, RunState.CANCELLED)
 #    it finalizes the run itself: a `stop()` in the starter's process kills
 #    the pid first and writes CANCELLED a moment later, and there is no
 #    cross-process lock to close that race, so the observer waits it out
-#    instead of writing FAILED over a cancel in flight.
+#    instead of writing FAILED over a cancel in flight. The window is
+#    measured from a durable anchor (`_last_sign_of_life`: created_at,
+#    events/stderr mtimes, `stop_requested_at`), not a per-call timer, so
+#    repeated `wait(run_id, 0)` calls from any process converge.
 # 2. (#55) How long a provider's child gets to exit on its own after its
 #    terminal `result` event has been written before `wait()` grace-kills it
 #    (`_kill_lingering`, via `_wait_or_kill` which itself waits up to this
@@ -483,21 +486,18 @@ class Harness:
         `run_id`.
         """
         deadline = None if timeout is None else time.monotonic() + timeout
-        gone_since: float | None = None
         while True:
             record = self._require_record(run_id)
             if record["state"] == RunState.RUNNING:
                 if self._finalize_if_ended(run_id, record):
                     continue
                 if self._is_gone(run_id, record):
-                    now = time.monotonic()
-                    if gone_since is None:
-                        gone_since = now
-                    if now - gone_since >= _FINALIZE_GRACE_S:
+                    # Durable anchor (file mtimes + record fields), so every
+                    # call and every process measures the same grace window.
+                    if time.time() - self._last_sign_of_life(record) >= _FINALIZE_GRACE_S:
                         self._finalize(run_id, record, None)
                         continue
                 else:
-                    gone_since = None
                     written_at = self._result_written_at(run_id, record)
                     if (
                         written_at is not None
@@ -531,6 +531,7 @@ class Harness:
         pid = record.get("pid")
         start_time = record.get("start_time")
         proc = self._processes.get(run_id)
+        signalled_live = False
 
         if pid is not None:
             status = _pid_status(pid, start_time)
@@ -549,6 +550,12 @@ class Harness:
                 return current
 
             if status:
+                signalled_live = True
+                # Durable marker: an observer in another process measures its
+                # gone-grace from this kill request, not from the child's
+                # last (possibly old) write.
+                record["stop_requested_at"] = time.time()
+                self.store.put(run_id, record)
                 delivered = _send_graceful_signal(pid)
                 if delivered:
                     deadline = time.monotonic() + timeout
@@ -568,7 +575,10 @@ class Harness:
             if proc.returncode is not None:
                 record["exit_code"] = proc.returncode
 
-        duration_s = time.time() - record.get("created_at", time.time())
+        ended_at = self._ended_at(
+            run_id, record, time.time() if signalled_live else None
+        )
+        duration_s = max(0.0, ended_at - record.get("created_at", ended_at))
         record["duration_s"] = duration_s
         record["state"] = transition(record["state"], RunState.CANCELLED)
         record["provenance_path"] = self._write_provenance(
@@ -683,6 +693,41 @@ class Harness:
             return True
         return False
 
+    def _last_sign_of_life(self, record: dict[str, Any]) -> float:
+        """The latest durable sign the run was alive: the max of
+        `created_at`, the events/stderr files' mtimes and the record's
+        `stop_requested_at`. Depends only on files and record fields, never
+        on in-memory state, so every call and process agrees. Never raises."""
+        candidates: list[float] = []
+        created = record.get("created_at")
+        if isinstance(created, (int, float)):
+            candidates.append(float(created))
+        stop_at = record.get("stop_requested_at")
+        if isinstance(stop_at, (int, float)):
+            candidates.append(float(stop_at))
+        for key in ("events_path", "stderr_path"):
+            path = record.get(key)
+            if path is None:
+                continue
+            try:
+                candidates.append(Path(path).stat().st_mtime)
+            except Exception:
+                pass
+        return max(candidates) if candidates else time.time()
+
+    def _ended_at(
+        self, run_id: str, record: dict[str, Any], observed_exit: float | None
+    ) -> float:
+        """When the run ended, for `duration_s`: the terminal-event time, else
+        an exit this process observed itself, else the last durable sign of
+        life."""
+        written_at = self._result_written_at(run_id, record)
+        if written_at is not None:
+            return written_at
+        if observed_exit is not None:
+            return observed_exit
+        return self._last_sign_of_life(record)
+
     def _result_written_at(self, run_id: str, record: dict[str, Any]) -> float | None:
         """When the run's terminal `result` event was written (#55), or
         `None` when it hasn't been yet, its provider has no
@@ -777,7 +822,10 @@ class Harness:
             return
         events_path = Path(record["events_path"])
         exit_code = proc.returncode if proc is not None else None
-        duration_s = time.time() - record.get("created_at", time.time())
+        ended_at = self._ended_at(
+            run_id, record, time.time() if proc is not None else None
+        )
+        duration_s = max(0.0, ended_at - record.get("created_at", ended_at))
 
         lines = self._read_event_lines(events_path)
 
