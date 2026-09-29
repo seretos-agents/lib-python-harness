@@ -90,7 +90,9 @@ alive) instead of killing the run. Only an explicit `stop()` yields
 `CANCELLED`. A run whose process vanished without being finalized is finalized
 by the observer (no exit code is known then, so the terminal `result` event
 alone decides `COMPLETED` vs `FAILED`; a `stop()` in the starter's process is
-still reported `CANCELLED`). A provider child that has already written its
+still reported `CANCELLED`). The grace before that is anchored on durable facts
+(file mtimes, `stop_requested_at`), so even repeated `wait(run_id, 0)` calls
+from a process without the `Popen` finalize it. A provider child that has already written its
 terminal event but keeps the OS process alive is grace-killed after a short
 period and finalized from that event alone (#55) — unless the pid's identity
 can't be verified, in which case `wait()` never signals it and just keeps
@@ -161,6 +163,8 @@ Content fields (`text`, `is_error`, `subtype`, `structured_output`, `usage`,
 `cost`) come from the CLI's own terminal `result` event; `session_id`,
 `transcript_path`, `state` and `duration_s` are the harness's own
 run-identity/lifecycle bookkeeping, which no single stream event carries.
+On a terminal result `duration_s` runs from creation to the end of the run
+(its terminal event / observed exit), not to whenever it was finalized.
 `timed_out` is `True` only on a `Harness.wait`/`wait_for`/`run`/`resume`
 result whose timeout expired while the run kept running (`state` stays
 `RUNNING`; continue with `wait(run_id)` — a time limit never cancels). While

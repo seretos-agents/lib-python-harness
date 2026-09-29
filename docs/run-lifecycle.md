@@ -72,16 +72,24 @@ new `RunState` and no new edge are added to the table above.
   not alive) is finalized by `poll()`, `list_runs()` and `wait()` without a
   `Popen`: no exit code is known, so the terminal `result` event alone decides
   `COMPLETED` vs `FAILED` (no such event -> `FAILED`). A trailing half-written
-  `events.jsonl` line is ignored. `wait` waits a short grace period after
-  the process vanished so a `stop()` running in the starter's process is
-  reported `CANCELLED`, not `FAILED`. On Windows the start time comes from
+  `events.jsonl` line is ignored. `wait` waits a short grace period so a
+  `stop()` running in the starter's process is reported `CANCELLED`, not
+  `FAILED`. The grace is measured from a durable anchor -- the latest of
+  `created_at`, the `events.jsonl`/`stderr.txt` mtimes and the record's
+  `stop_requested_at` (set by `stop()` before it signals a live pid) -- not
+  from a per-call timer, so repeated `wait(run_id, 0)` calls, even from a
+  process without the `Popen`, finalize a gone run once that anchor is
+  older than the grace period. `duration_s` of a finalized run ends at the
+  terminal event (or the exit this process observed, or the last sign of
+  life), not at whenever an observer got round to finalizing. On Windows the start time comes from
   `GetProcessTimes` via `ctypes`; `psutil` is not required.
 - **Post-completion grace-kill (#55).** A provider child that has already
   written its terminal event to `events.jsonl` (scoped by
   `Provider.has_terminal_event`, when the provider has one — today only
   `ClaudeCliProvider`) but keeps its OS process alive is killed by `wait()`
   once that event has aged past `_FINALIZE_GRACE_S`, and the run is finalized
-  from the terminal event alone, same as orphan reconciliation above; the
+  from the terminal event alone, same as orphan reconciliation above (its
+  `duration_s` ends at that event, not at the kill); the
   grace window is anchored to the events file's own mtime, not to when a
   particular `wait()` call started, so it survives repeated short calls and
   late-arriving observers alike. It never signals a pid whose identity can't
