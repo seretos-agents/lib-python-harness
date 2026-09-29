@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lib-python-harness"
-version = "0.1.0"
+version = "0.0.11"
 description = "Provider-independent subagent engine: lifecycle, dispatch and transport abstraction."
 requires-python = ">=3.11"
 authors = [{ name = "Arne von Appen" }]
