@@ -302,3 +302,28 @@ def test_disallowed_tools_empty_string_emits_flag_with_empty_operand(tmp_path):
 
     inherit_plan = _inherit_plan(tmp_path, disallowed_tools="")
     _assert_one_disallowed_flag(inherit_plan.argv, "")
+
+
+# -- #61 R5: the background-wait ceiling env ---------------------------------
+
+_CEILING_ENV = "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS"
+
+
+@pytest.mark.parametrize("kind", ["clean", "inherit", "resume"])
+@pytest.mark.parametrize("ceiling, expected", [(None, "3600000"), (0, "0"), (90000, "90000")])
+def test_launch_env_sets_background_wait_ceiling(tmp_path, monkeypatch, kind, ceiling, expected):
+    monkeypatch.setenv(_CEILING_ENV, "5")  # parent value must not be inherited
+    if kind == "resume":
+        if ceiling is not None:
+            pytest.skip("resume has no origin spec; it always uses the default")
+        plan = ClaudeCliProvider().build_resume_plan(
+            provider_argv=["claude"],
+            session_id=str(uuid.uuid4()),
+            cwd=tmp_path,
+            prompt="again",
+        )
+    else:
+        overrides = {} if ceiling is None else {"background_wait_ceiling_ms": ceiling}
+        builder = _build_plan if kind == "clean" else _inherit_plan
+        plan = builder(tmp_path, **overrides)
+    assert plan.env[_CEILING_ENV] == expected
