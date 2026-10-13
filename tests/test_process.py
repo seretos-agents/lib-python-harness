@@ -256,16 +256,19 @@ def test_unreaped_zombie_child_reads_as_not_alive(tmp_path):
 # links) and a top-pid kill cannot reach. Job membership (Windows) / the
 # process group (POSIX) does.
 
+_INTERMEDIATE = "\n".join(
+    [
+        "import os, subprocess, sys",
+        "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'],"
+        " stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)",
+        "open(sys.argv[1] + '.tmp', 'w').write(str(p.pid))",
+        "os.replace(sys.argv[1] + '.tmp', sys.argv[1])",
+    ]
+)
+
 _ORPHAN_PARENT = (
     "import subprocess, sys, time\n"
-    "inter = (\n"
-    "    'import subprocess, sys\n'\n"
-    "    'p = subprocess.Popen([sys.executable, \"-c\", \"import time; time.sleep(120)\"],"
-    " stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n'\n"
-    "    'open(sys.argv[1] + \".tmp\", \"w\").write(str(p.pid))\n'\n"
-    "    'import os; os.replace(sys.argv[1] + \".tmp\", sys.argv[1])\n'\n"
-    ")\n"
-    "subprocess.run([sys.executable, '-c', inter, sys.argv[1]], check=True,"
+    f"subprocess.run([sys.executable, '-c', {_INTERMEDIATE!r}, sys.argv[1]], check=True,"
     " stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
     "time.sleep(120)\n"
 )

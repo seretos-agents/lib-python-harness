@@ -120,6 +120,13 @@ class RunSpec:
     strict_mcp: bool | None = None
     memory: bool | None = None
 
+    # -- Claude-only (#61): how long (ms) a headless `claude -p` child waits for
+    # its `run_in_background` tasks before giving up; set as
+    # `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS` in the child env. `None` = the
+    # provider's default (one hour); `0` is passed through verbatim. Other
+    # providers ignore it.
+    background_wait_ceiling_ms: int | None = None
+
 
 @dataclass(frozen=True)
 class LaunchPlan:

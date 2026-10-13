@@ -43,6 +43,7 @@ from .providers.mistral_cli import MistralCliProvider
 from .runtime.lifecycle import RunState, transition
 from .runtime.process import (
     _capture_start_time,
+    _close_tree,
     _force_kill,
     _pid_status,
     _reap_until_gone,
@@ -278,6 +279,7 @@ class Harness:
                 stdin_text=plan.stdin,
                 events_path=events_path,
                 stderr_path=stderr_path,
+                tree_name=run_id,
             )
         except Exception:
             self._remove_cleanup_paths(record)
@@ -566,6 +568,7 @@ class Harness:
                 if still_alive():
                     _force_kill(pid)
                 _reap_until_gone(pid)
+            _close_tree(pid, run_id, kill=signalled_live)
 
         if proc is not None:
             try:
@@ -783,6 +786,7 @@ class Harness:
         if not status:
             return False  # already gone; the ended/gone paths handle it
         _wait_or_kill(pid, _FINALIZE_GRACE_S, start_time)
+        _close_tree(pid, run_id, kill=True)
         if proc is not None:
             try:
                 proc.wait(timeout=1.0)
@@ -848,6 +852,15 @@ class Harness:
         provenance_path = self._write_provenance(
             record, exit_code=exit_code, duration_s=duration_s
         )
+
+        # Release the Windows job handle; when the child exited with launches
+        # still pending, also take down the tree its background shell lives in.
+        if record.get("pid") is not None:
+            _close_tree(
+                record["pid"],
+                run_id,
+                kill=bool(parsed and parsed.abandoned_background_tasks),
+            )
 
         self._remove_cleanup_paths(record)
         failed = (
