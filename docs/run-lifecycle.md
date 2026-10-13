@@ -84,12 +84,12 @@ new `RunState` and no new edge are added to the table above.
   life), not at whenever an observer got round to finalizing. On Windows the start time comes from
   `GetProcessTimes` via `ctypes`; `psutil` is not required.
 - **Post-completion grace-kill (#55).** A provider child that has already
-  written its terminal event to `events.jsonl` (scoped by
+  written its terminal event (a `result` with no pending `run_in_background` launch, #61; a pending one means the child still waits and will write a second `result`) to `events.jsonl` (scoped by
   `Provider.has_terminal_event`, when the provider has one — today only
   `ClaudeCliProvider`) but keeps its OS process alive is killed by `wait()`
   once that event has aged past `_FINALIZE_GRACE_S`, and the run is finalized
   from the terminal event alone, same as orphan reconciliation above (its
-  `duration_s` ends at that event, not at the kill); the
+  `duration_s` ends at that event, not at the kill; the kill, `stop()`, and a finalize after an exit with pending launches take down the child's whole process tree via a named Windows Job Object / the POSIX process group); the
   grace window is anchored to the events file's own mtime, not to when a
   particular `wait()` call started, so it survives repeated short calls and
   late-arriving observers alike. It never signals a pid whose identity can't

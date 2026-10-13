@@ -247,3 +247,85 @@ def test_unreaped_zombie_child_reads_as_not_alive(tmp_path):
         assert _pid_status(proc.pid, start_time) is False
     finally:
         proc.wait(timeout=10)
+
+
+# -- #61: whole-tree close (_close_tree) ---------------------------------------
+#
+# The child spawns an intermediate that starts a long sleeper and exits at
+# once -- the sleeper is an orphaned descendant that `taskkill /T` (parent-pid
+# links) and a top-pid kill cannot reach. Job membership (Windows) / the
+# process group (POSIX) does.
+
+_INTERMEDIATE = "\n".join(
+    [
+        "import os, subprocess, sys",
+        "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'],"
+        " stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)",
+        "open(sys.argv[1] + '.tmp', 'w').write(str(p.pid))",
+        "os.replace(sys.argv[1] + '.tmp', sys.argv[1])",
+    ]
+)
+
+_ORPHAN_PARENT = (
+    "import subprocess, sys, time\n"
+    f"subprocess.run([sys.executable, '-c', {_INTERMEDIATE!r}, sys.argv[1]], check=True,"
+    " stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+    "time.sleep(120)\n"
+)
+
+
+def _spawn_orphan_tree(tmp_path, tree_name):
+    pidfile = tmp_path / "gpid"
+    proc = _spawn_detached(
+        argv=[sys.executable, "-c", _ORPHAN_PARENT, str(pidfile)],
+        cwd=str(tmp_path),
+        env=None,
+        stdin_text="",
+        events_path=tmp_path / "events.jsonl",
+        stderr_path=tmp_path / "stderr.txt",
+        tree_name=tree_name,
+    )
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline and not (
+        pidfile.exists() and pidfile.read_text().strip()
+    ):
+        time.sleep(0.05)
+    gpid = int(pidfile.read_text().strip())
+    return proc, gpid, _capture_start_time(gpid)
+
+
+def _hard_kill(*pids):
+    for pid in pids:
+        try:
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True)
+            else:
+                os.kill(pid, 9)
+        except OSError:
+            pass
+
+
+def test_close_tree_kill_reaches_an_orphaned_descendant(tmp_path):
+    from lib_python_harness.runtime.process import _close_tree
+
+    proc, gpid, gstart = _spawn_orphan_tree(tmp_path, f"t61-kill-{os.getpid()}")
+    try:
+        _close_tree(proc.pid, f"t61-kill-{os.getpid()}", kill=True)
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline and _pid_status(gpid, gstart) is not False:
+            time.sleep(0.1)
+        assert _pid_status(gpid, gstart) is False
+    finally:
+        _hard_kill(gpid, proc.pid)
+
+
+def test_close_tree_without_kill_leaves_it(tmp_path):
+    from lib_python_harness.runtime.process import _close_tree
+
+    proc, gpid, gstart = _spawn_orphan_tree(tmp_path, f"t61-keep-{os.getpid()}")
+    try:
+        _close_tree(proc.pid, f"t61-keep-{os.getpid()}", kill=False)
+        time.sleep(0.5)
+        assert _pid_status(gpid, gstart) is not False
+    finally:
+        _hard_kill(gpid, proc.pid)

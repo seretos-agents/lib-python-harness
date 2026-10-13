@@ -348,6 +348,20 @@ def _scrub_env() -> dict[str, str]:
     return scrub_env(SCRUBBED_ENV, (_SCRUBBED_ENV_PREFIX,))
 
 
+# #61: Claude's own ceiling (600000 ms) is what sweeps a long background
+# command; the default here is finite and well above it.
+_BG_WAIT_CEILING_ENV = "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS"
+_DEFAULT_BG_WAIT_CEILING_MS = 3_600_000
+
+
+def _child_env(ceiling_ms: int | None = None) -> dict[str, str]:
+    env = _scrub_env()
+    env[_BG_WAIT_CEILING_ENV] = str(
+        _DEFAULT_BG_WAIT_CEILING_MS if ceiling_ms is None else ceiling_ms
+    )
+    return env
+
+
 # #42 pending-background-launch walk (`ClaudeCliProvider.parse_events`): the
 # three text shapes that can resolve a `run_in_background: true` launch L
 # (its tool_use id) to, or past, its background task id T.
@@ -433,7 +447,7 @@ class ClaudeCliProvider:
         if spec.json_schema is not None:
             argv += ["--json-schema", json.dumps(spec.json_schema)]
 
-        env = _scrub_env()
+        env = _child_env(spec.background_wait_ceiling_ms)
 
         return LaunchPlan(argv=argv, cwd=str(cwd), env=env, stdin=spec.prompt)
 
@@ -497,7 +511,7 @@ class ClaudeCliProvider:
                 argv += ["--add-dir", str(Path(run_dir) / "agents")]
                 argv += ["--agent", _agent_file_stem(spec.agent_name)]
 
-        env = _scrub_env()
+        env = _child_env(spec.background_wait_ceiling_ms)
 
         return LaunchPlan(argv=argv, cwd=str(cwd), env=env, stdin=spec.prompt)
 
@@ -539,7 +553,7 @@ class ClaudeCliProvider:
             run_cwd = str(cwd)
         else:
             run_cwd = tempfile.mkdtemp(prefix="lib-python-harness-cwd-")
-        return LaunchPlan(argv=argv, cwd=run_cwd, env=_scrub_env(), stdin=prompt)
+        return LaunchPlan(argv=argv, cwd=run_cwd, env=_child_env(), stdin=prompt)
 
     def describe_last_activity(self, lines: Iterable[str]) -> str | None:
         """Short label for the newest recognizable event of a (possibly
@@ -560,24 +574,25 @@ class ClaudeCliProvider:
         return None
 
     def has_terminal_event(self, lines: Iterable[str]) -> bool:
-        """`True` iff some line in `lines` parses to a dict with
-        `type == "result"` — the post-completion grace-kill's scoping probe
-        (#55): `Harness` looks this up with `getattr`, like
+        """`True` iff the stream holds a `result` and no `run_in_background`
+        launch is still pending — the post-completion grace-kill's scoping
+        probe (#55, #61): `Harness` looks this up with `getattr`, like
         `describe_last_activity`, so a provider without it (Codex, Mistral,
-        an injected fake) is never grace-killed. Torn/garbage lines are
-        skipped, never raised on — the same tolerance `describe_last_activity`
-        applies to a still-growing stream."""
+        an injected fake) is never grace-killed. A `result` with a pending
+        launch is not terminal: the child is waiting for the task and will
+        write a second `result`. Torn/garbage lines are skipped, never raised
+        on."""
+        kept = []
         for line in lines:
-            line = line.strip()
-            if not line:
-                continue
             try:
-                event = json.loads(line)
+                if isinstance(json.loads(line), dict):
+                    kept.append(line)
             except ValueError:
                 continue
-            if isinstance(event, dict) and event.get("type") == "result":
-                return True
-        return False
+        try:
+            return not self.parse_events(kept).abandoned_background_tasks
+        except ValueError:  # no `result` yet
+            return False
 
     @staticmethod
     def _content_blocks(event: Any) -> list[dict]:

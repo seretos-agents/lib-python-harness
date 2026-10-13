@@ -272,3 +272,35 @@ def test_has_terminal_event_detects_only_a_result_line():
     # torn/garbage lines are skipped, not raised on
     assert provider.has_terminal_event(["not json at all", '{"type": "res']) is False
     assert provider.has_terminal_event(["not json at all", _TERMINAL_RESULT]) is True
+
+
+# -- #61: a `result` with a pending background launch is not terminal ---------
+
+
+def test_has_terminal_event_is_false_for_a_result_with_a_pending_launch():
+    lines = [_INIT_LINE] + _bg_launch("L1", task_id="bg1") + [_TERMINAL_RESULT]
+    assert ClaudeCliProvider().has_terminal_event(lines) is False
+
+
+def test_has_terminal_event_is_true_once_the_launch_is_notified():
+    lines = (
+        [_INIT_LINE]
+        + _bg_launch("L1", task_id="bg1")
+        + [_TERMINAL_RESULT, _notification("L1", task_id="bg1"), _TERMINAL_RESULT]
+    )
+    assert ClaudeCliProvider().has_terminal_event(lines) is True
+
+
+def test_has_terminal_event_is_true_when_a_poll_shows_the_launch_not_running():
+    lines = (
+        [_INIT_LINE]
+        + _bg_launch("L1", task_id="bg1")
+        + _poll("bg1", "completed")
+        + [_TERMINAL_RESULT]
+    )
+    assert ClaudeCliProvider().has_terminal_event(lines) is True
+
+
+def test_has_terminal_event_pending_launch_tolerates_torn_lines():
+    lines = [_INIT_LINE] + _bg_launch("L1") + ["garbage", _TERMINAL_RESULT, '{"type": "res']
+    assert ClaudeCliProvider().has_terminal_event(lines) is False

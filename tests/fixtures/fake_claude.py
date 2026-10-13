@@ -115,6 +115,32 @@ def main() -> int:
     }
     print(json.dumps(init_event), flush=True)
 
+    # --background-grandchild <pidfile> (#61): spawn a real `sleep 120` Python
+    # process through an intermediate Python that writes the sleeper's pid to
+    # <pidfile> and exits at once -- the orphaned-in-tree shape (a descendant
+    # whose parent already exited) that `taskkill /T` / a top-pid kill miss.
+    if "--background-grandchild" in argv:
+        import subprocess
+
+        pidfile = argv[argv.index("--background-grandchild") + 1]
+        intermediate = "\n".join(
+            [
+                "import os, subprocess, sys",
+                "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'],"
+                " stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,"
+                " stderr=subprocess.DEVNULL)",
+                "open(sys.argv[1] + '.tmp', 'w').write(str(p.pid))",
+                "os.replace(sys.argv[1] + '.tmp', sys.argv[1])",
+            ]
+        )
+        subprocess.run(
+            [sys.executable, "-c", intermediate, pidfile],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+        )
+
     # --background-task <id>: right after init and before any
     # --ticks/--tool-ticks output, emits a Bash tool_use launched with
     # run_in_background: true (id = <id>) plus its ack tool_result naming a
@@ -214,6 +240,47 @@ def main() -> int:
             )
 
         if "--background-notify" in argv:
+            print(
+                json.dumps(
+                    {
+                        "type": "user",
+                        "message": {
+                            "content": (
+                                "<task-notification>\n"
+                                f"<task-id>{task_id}</task-id>\n"
+                                f"<tool-use-id>{launch_id}</tool-use-id>\n"
+                                "<status>completed</status>\n"
+                                "</task-notification>"
+                            )
+                        },
+                    }
+                ),
+                flush=True,
+            )
+
+        # --background-hold <s> (#61): the real CLI shape for a pending
+        # background launch -- a first `result` ("waiting for notification"),
+        # the process stays alive for <s>, then the <task-notification> for
+        # the launch lands and the normal final events (second `result` =
+        # --reply) follow.
+        if "--background-hold" in argv:
+            hold = float(argv[argv.index("--background-hold") + 1])
+            print(
+                json.dumps(
+                    {
+                        "type": "result",
+                        "subtype": "success",
+                        "is_error": False,
+                        "result": "waiting for notification",
+                        "session_id": session_id,
+                        "duration_ms": 1,
+                        "usage": {"input_tokens": 1, "output_tokens": 1},
+                        "total_cost_usd": 0.0,
+                    }
+                ),
+                flush=True,
+            )
+            time.sleep(hold)
             print(
                 json.dumps(
                     {

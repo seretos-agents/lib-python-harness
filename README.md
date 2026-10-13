@@ -94,7 +94,7 @@ still reported `CANCELLED`). The grace before that is anchored on durable facts
 (file mtimes, `stop_requested_at`), so even repeated `wait(run_id, 0)` calls
 from a process without the `Popen` finalize it. A provider child that has already written its
 terminal event but keeps the OS process alive is grace-killed after a short
-period and finalized from that event alone (#55) — unless the pid's identity
+period and finalized from that event alone (#55; a `result` while a `run_in_background` launch is still pending is not terminal, the child is waiting for it, #61; every kill takes down the child's whole process tree) — unless the pid's identity
 can't be verified, in which case `wait()` never signals it and just keeps
 waiting. `list_runs()` returns a `RunSummary` per stored
 run, oldest first, reconciling orphaned `RUNNING` records the same way `poll()`
@@ -175,7 +175,9 @@ wrote, i.e. working or hung) and `last_activity` (provider-derived label of
 the newest event, e.g. `tool_use:Bash`, `text`, `tool_result`, `init`; `None`
 for providers without one or an unrecognizable stream) show live progress; on
 a terminal result `event_count` / `last_event_at` / `last_activity` are
-`0` / `None` / `None`. `abandoned_background_tasks` names every
+`0` / `None` / `None`. `RunSpec.background_wait_ceiling_ms` (Claude only) sets how long
+the child waits for its background tasks (`CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS`; default
+3 600 000, `0` passed through verbatim). `abandoned_background_tasks` names every
 `run_in_background: true` task a `claude` run launched but never reported
 finished (by notification, a poll, or `TaskStop`) before its own turn ended —
 `()` for every other provider and every claude run that launched none —

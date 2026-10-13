@@ -3,11 +3,14 @@
 `_send_graceful_signal`, `_force_kill`, `_reap_until_gone`, `_wait_or_kill`,
 `_capture_start_time`), copied not imported. POSIX is the reference
 behaviour; native Windows gets a minimal `os.name == "nt"` branch at each
-point where a POSIX primitive does not exist or is destructive (no Job Object
-/ handle-scan machinery, no new dependency): `shutil.which` for PATHEXT shims
+point where a POSIX primitive does not exist or is destructive (no
+handle-scan machinery, no new dependency): `shutil.which` for PATHEXT shims
 (the npm `codex.cmd`), `CREATE_NEW_PROCESS_GROUP`, a non-destructive liveness
 check (never `os.kill(pid, 0)` — on Windows that is `TerminateProcess`), and
-`taskkill /T /F` so a shim's grandchild dies with it.
+`taskkill /T /F` so a shim's grandchild dies with it. A run's whole process
+tree (also descendants orphaned by an exited parent) is closed by
+`_close_tree`: a named Windows Job Object assigned at spawn, the process group
+on POSIX.
 
 Unlike that reference: stdin carries the run's prompt text (via a backing
 file, never a blocking pipe write — see `_spawn_detached`), and
@@ -53,6 +56,7 @@ def _spawn_detached(
     stdin_text: str,
     events_path: Path,
     stderr_path: Path,
+    tree_name: str | None = None,
 ) -> subprocess.Popen:
     """Spawn `argv`, stdin from `stdin_text`, stdout to `events_path`,
     stderr to `stderr_path`. POSIX `start_new_session=True` (Windows:
@@ -64,6 +68,11 @@ def _spawn_detached(
     write from the parent can deadlock against a child that has not yet
     started reading, for no benefit here since stdout/stderr are already
     going straight to files rather than pipes we'd need to drain.
+
+    `tree_name` (Windows only; POSIX needs nothing, `start_new_session` makes
+    the pgid the pid) puts the child into a named Job Object so `_close_tree`
+    can later reach the whole tree, including descendants whose parent has
+    already exited (which `taskkill /T` cannot). Best effort.
     """
     events_path = Path(events_path)
     stderr_path = Path(stderr_path)
@@ -92,7 +101,79 @@ def _spawn_detached(
             stderr=stderr_file,
             **kwargs,
         )
+    if _IS_WINDOWS and tree_name:
+        _assign_job(proc.pid, tree_name)
     return proc
+
+
+_JOBS: dict[str, object] = {}  # tree_name -> job handle opened by this process
+_PROCESS_SET_QUOTA = 0x0100
+_PROCESS_TERMINATE = 0x0001
+_JOB_OBJECT_TERMINATE = 0x0008
+
+
+def _job_name(tree_name: str) -> str:
+    return "Local\\lib-python-harness-" + tree_name
+
+
+def _job_kernel32():
+    from ctypes import wintypes
+
+    k = _kernel32()
+    k.CreateJobObjectW.restype = wintypes.HANDLE
+    k.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+    k.OpenJobObjectW.restype = wintypes.HANDLE
+    k.OpenJobObjectW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+    k.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    k.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    return k
+
+
+def _assign_job(pid: int, tree_name: str) -> None:
+    """Create the named job and assign `pid` to it. No `KILL_ON_JOB_CLOSE`:
+    runs outlive the starting process. Never raises; on failure `taskkill`
+    stays the fallback."""
+    try:
+        k = _job_kernel32()
+        job = k.CreateJobObjectW(None, _job_name(tree_name))
+        if not job:
+            return
+        proc = k.OpenProcess(_PROCESS_SET_QUOTA | _PROCESS_TERMINATE, False, pid)
+        ok = bool(proc) and k.AssignProcessToJobObject(job, proc)
+        if proc:
+            k.CloseHandle(proc)
+        if ok:
+            _JOBS[tree_name] = job
+        else:
+            k.CloseHandle(job)
+    except Exception:
+        pass
+
+
+def _close_tree(pid: int | None, tree_name: str | None, *, kill: bool) -> None:
+    """Kill (`kill=True`) the run's whole process tree and/or release the
+    tree handle. Windows: the named job (own handle, else opened by name --
+    works from another process while any member lives). POSIX: `killpg` on the
+    run's group (pgid == pid via `start_new_session`). Never raises."""
+    try:
+        if _IS_WINDOWS:
+            if not tree_name:
+                return
+            k = _job_kernel32()
+            job = _JOBS.pop(tree_name, None)
+            if not job and kill:
+                job = k.OpenJobObjectW(_JOB_OBJECT_TERMINATE, False, _job_name(tree_name))
+            if job:
+                if kill:
+                    k.TerminateJobObject(job, 1)
+                k.CloseHandle(job)
+        elif kill and pid is not None and pid != os.getpgrp():
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+    except Exception:
+        pass
 
 
 def _capture_start_time(pid: int) -> float | None:

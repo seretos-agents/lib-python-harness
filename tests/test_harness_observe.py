@@ -626,18 +626,221 @@ def test_wait_grace_kills_a_child_lingering_after_its_result(tmp_path):
     assert _pid_status(record["pid"], record["start_time"]) is False, "child was not killed"
 
 
-def test_wait_grace_kills_a_lingering_child_with_an_abandoned_background_task(tmp_path):
-    """R1 additional coverage (a): the grace-kill finalizes from the terminal
-    event alone, so an abandoned background task still fails the run exactly
-    as it would for a child that exited normally."""
+def _count_results(events_path) -> int:
+    count = 0
+    for line in Path(events_path).read_text(encoding="utf-8").splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict) and event.get("type") == "result":
+            count += 1
+    return count
+
+
+def _start_spied(tmp_path, monkeypatch, *fake_args):
+    """Start a fake run with spies on every harness kill primitive; each spy
+    call records how many `result` lines events.jsonl held at that moment,
+    then delegates to the real primitive."""
+    from lib_python_harness.runtime import process as process_module
+
+    calls: list[tuple[str, int]] = []
+    holder: dict = {}
+
+    def wrap(name, real):
+        def spy(*args, **kwargs):
+            calls.append((name, _count_results(holder["events"])))
+            return real(*args, **kwargs)
+
+        return spy
+
+    monkeypatch.setattr(
+        harness_module, "_wait_or_kill", wrap("_wait_or_kill", _wait_or_kill), raising=False
+    )
+    monkeypatch.setattr(
+        harness_module,
+        "_force_kill",
+        wrap("_force_kill", process_module._force_kill),
+        raising=False,
+    )
     store = InMemoryRunStore()
-    harness = _harness_with_fake(store, "--background-task", "bg1", "--linger", "60")
+    harness = _harness_with_fake(store, *fake_args)
+    holder["events"] = tmp_path / "not-yet"
     run_id = harness.start(_spec(tmp_path)).run_id
+    holder["events"] = store.get(run_id)["events_path"]
+    return harness, store, run_id, calls
+
+
+def test_wait_does_not_kill_a_child_with_a_pending_background_launch(tmp_path, monkeypatch):
+    """#61 R1 driving test: a child that wrote a first `result` but still has
+    a pending `run_in_background` launch is NOT terminal -- Claude Code keeps
+    running and writes a second `result`. wait() must not grace-kill it
+    before then, and returns the deferred reply."""
+    harness, store, run_id, calls = _start_spied(
+        tmp_path,
+        monkeypatch,
+        "--background-task", "L",
+        "--background-hold", "6",
+        "--reply", "SLEEP_DONE",
+    )
+
+    result = harness.wait(run_id, timeout=40)
+
+    early = [c for c in calls if c[1] < 2]
+    assert not early, f"killed before the second result: {calls}"
+    assert result.state is RunState.COMPLETED
+    assert result.text == "SLEEP_DONE"
+    assert result.abandoned_background_tasks == ()
+    assert _count_results(store.get(run_id)["events_path"]) == 2
+
+
+def test_pending_launch_then_linger_is_grace_killed_after_the_second_result(
+    tmp_path, monkeypatch
+):
+    """#61 R1 edge: once the deferred second `result` is on disk with nothing
+    pending, the #55 grace-kill applies again."""
+    harness, store, run_id, calls = _start_spied(
+        tmp_path,
+        monkeypatch,
+        "--background-task", "L",
+        "--background-hold", "4",
+        "--linger", "60",
+        "--reply", "SLEEP_DONE",
+    )
+
+    began = time.monotonic()
+    result = harness.wait(run_id, timeout=40)
+
+    assert not [c for c in calls if c[1] < 2], f"killed before the second result: {calls}"
+    assert result.state is RunState.COMPLETED
+    assert result.text == "SLEEP_DONE"
+    assert time.monotonic() - began < 4 + _GRACE_BOUND
+    record = store.get(run_id)
+    assert _pid_status(record["pid"], record["start_time"]) is False
+
+
+def test_observer_wait_does_not_kill_a_child_with_a_pending_background_launch(tmp_path):
+    """#61 R1 edge: the cross-process waiter agrees."""
+    run_id = _start_and_let_starter_exit(
+        tmp_path,
+        fake_args=[
+            "--background-task", "L",
+            "--background-hold", "6",
+            "--reply", "SLEEP_DONE",
+        ],
+    )
+
+    result = _observer(tmp_path).wait(run_id, timeout=40)
+
+    assert result.state is RunState.COMPLETED
+    assert result.text == "SLEEP_DONE"
+    assert result.abandoned_background_tasks == ()
+
+
+def test_wait_does_not_kill_a_lingering_child_with_a_pending_launch_and_fails_on_exit(
+    tmp_path, monkeypatch
+):
+    """#61 R4 driving test (rewrites the #55 test that pinned the bug): a
+    child that really exits with a launch still pending is never killed by
+    the grace hook; once it exits by itself the run is FAILED + abandoned."""
+    harness, store, run_id, calls = _start_spied(
+        tmp_path, monkeypatch, "--background-task", "bg1", "--linger", "8"
+    )
 
     result = harness.wait(run_id, timeout=30)
 
+    assert calls == [], f"harness killed a child with a pending launch: {calls}"
     assert result.state is RunState.FAILED
     assert result.abandoned_background_tasks == ("bg1",)
+
+
+def _read_pid(pidfile: Path, deadline_s: float = 20.0) -> int:
+    deadline = time.monotonic() + deadline_s
+    while time.monotonic() < deadline:
+        if pidfile.exists():
+            text = pidfile.read_text().strip()
+            if text:
+                return int(text)
+        time.sleep(0.05)
+    raise AssertionError("fake CLI never wrote the grandchild pidfile")
+
+
+def _assert_grandchild_gone(pid: int, start_time, budget_s: float = 8.0) -> None:
+    deadline = time.monotonic() + budget_s
+    while time.monotonic() < deadline:
+        if _pid_status(pid, start_time) is False:
+            return
+        time.sleep(0.1)
+    raise AssertionError(f"backgrounded grandchild {pid} survived the kill")
+
+
+def _kill_leftover(pid: int) -> None:
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True)
+        else:
+            os.kill(pid, 9)
+    except OSError:
+        pass
+
+
+def test_stop_kills_the_backgrounded_grandchild(tmp_path):
+    """#61 R3 driving test: stop() takes down the whole process tree, incl. a
+    descendant whose parent already exited."""
+    pidfile = tmp_path / "gpid"
+    harness = _harness_with_fake(
+        InMemoryRunStore(),
+        "--background-task", "L",
+        "--background-grandchild", str(pidfile),
+        "--background-hold", "60",
+    )
+    run_id = harness.start(_spec(tmp_path)).run_id
+    gpid = _read_pid(pidfile)
+    start_time = _capture_start_time(gpid)
+    try:
+        harness.stop(run_id)
+        _assert_grandchild_gone(gpid, start_time)
+    finally:
+        _kill_leftover(gpid)
+
+
+def test_grace_kill_kills_the_backgrounded_grandchild(tmp_path):
+    """#61 R3 edge: the #55 grace-kill also takes the whole tree."""
+    pidfile = tmp_path / "gpid"
+    harness = _harness_with_fake(
+        InMemoryRunStore(), "--background-grandchild", str(pidfile), "--linger", "60"
+    )
+    run_id = harness.start(_spec(tmp_path)).run_id
+    gpid = _read_pid(pidfile)
+    start_time = _capture_start_time(gpid)
+    try:
+        result = harness.wait(run_id, timeout=30)
+        assert result.state is RunState.COMPLETED
+        _assert_grandchild_gone(gpid, start_time)
+    finally:
+        _kill_leftover(gpid)
+
+
+def test_exit_with_pending_launch_kills_the_grandchild(tmp_path):
+    """#61 R3 edge: a child that exited with a launch pending stays FAILED +
+    abandoned, and finalize takes the leftover tree down."""
+    pidfile = tmp_path / "gpid"
+    harness = _harness_with_fake(
+        InMemoryRunStore(),
+        "--background-task", "L",
+        "--background-grandchild", str(pidfile),
+        "--linger", "2",
+    )
+    run_id = harness.start(_spec(tmp_path)).run_id
+    gpid = _read_pid(pidfile)
+    start_time = _capture_start_time(gpid)
+    try:
+        result = harness.wait(run_id, timeout=30)
+        assert result.state is RunState.FAILED
+        assert result.abandoned_background_tasks == ("L",)
+        _assert_grandchild_gone(gpid, start_time)
+    finally:
+        _kill_leftover(gpid)
 
 
 def test_repeated_short_waits_still_grace_kill_a_lingering_child(tmp_path):
